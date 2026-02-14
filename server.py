@@ -20,6 +20,7 @@ from openreward.environments import (
     Environment,
     JSONObject,
     Server,
+    Split,
     TextBlock,
     ToolOutput,
     tool,
@@ -110,16 +111,39 @@ class FrontierScience(Environment):
     """
 
     @classmethod
-    def list_splits(cls) -> list[str]:
+    def list_splits(cls) -> list[Split]:
         """Return available splits"""
-        return ["test"]
+        return [
+            Split(name="test", type="test"),
+            Split(name="olympic", type="test"),
+            Split(name="research", type="test"),
+        ]
 
     @classmethod
     def list_tasks(cls, split: str) -> list[JSONObject]:
         """Return all tasks for a given split"""
-        if split != "test":
+        if split == "test":
+            # Return all tasks for the "test" split
+            return [{"task_id": t["task_id"]} for t in TASKS]
+
+        elif split == "olympic":
+            # Return only olympiad track tasks (short-answer, no rubrics)
+            return [
+                {"task_id": t["task_id"]}
+                for t in TASKS
+                if not cls._is_research_track_static(t["answer"])
+            ]
+
+        elif split == "research":
+            # Return only research track tasks (rubric-based grading)
+            return [
+                {"task_id": t["task_id"]}
+                for t in TASKS
+                if cls._is_research_track_static(t["answer"])
+            ]
+
+        else:
             return []
-        return [{"task_id": t["task_id"]} for t in TASKS]
 
     def __init__(
         self, task_spec: JSONObject, secrets: dict[str, str] = {}
@@ -220,6 +244,11 @@ Please solve this problem and submit your final answer using the `submit_answer`
         Returns:
             True if Research track, False if Olympiad track
         """
+        return "Points:" in answer and "Item:" in answer
+
+    @staticmethod
+    def _is_research_track_static(answer: str) -> bool:
+        """Static version of research track detection for class-level filtering"""
         return "Points:" in answer and "Item:" in answer
 
     # ========================================================================
