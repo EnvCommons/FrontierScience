@@ -286,7 +286,11 @@ Please solve this problem and submit your final answer using the `submit_answer`
             grading_response = ""
             for item in response.output:
                 if hasattr(item, "content") and item.content:
-                    grading_response = item.content
+                    # Handle content as list (OpenAI Responses API returns list of blocks)
+                    if isinstance(item.content, list):
+                        grading_response = item.content[0].text if item.content else ""
+                    else:
+                        grading_response = item.content
                 elif hasattr(item, "text") and item.text:
                     grading_response = item.text
 
@@ -466,7 +470,13 @@ Please solve this problem and submit your final answer using the `submit_answer`
             grading_response = ""
             for item in response.output:
                 if hasattr(item, "content") and item.content:
-                    grading_response = item.content[0].text
+                    # Handle content as list (OpenAI Responses API returns list of blocks)
+                    if isinstance(item.content, list):
+                        grading_response = item.content[0].text if item.content else ""
+                    else:
+                        grading_response = item.content
+                elif hasattr(item, "text") and item.text:
+                    grading_response = item.text
 
             score = self._parse_score(grading_response, rubric_item["points"])
 
