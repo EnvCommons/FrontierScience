@@ -67,7 +67,7 @@ The reference answer: {reference_answer}
 
 The attempted answer: {submitted_answer}
 
-First, think step-by-step about whether the attempted answer matches the reference answer. If the attempted answer is correct, write ”VERDICT: CORRECT” in the last line of your response, with no other text or formatting. If it is incorrect, write ”VERDICT: INCORRECT”."""
+First, think step-by-step about whether the attempted answer matches the reference answer. Then give your verdict in the last line of your response, wrapped in answer tags and containing nothing else: <answer>CORRECT</answer> if the attempted answer is correct, or <answer>INCORRECT</answer> if it is not."""
 
 RESEARCH_GRADER_TEMPLATE = """You are grading a science exam. You will be given the problem, attempted answer, and a rubric to grade the answer. The rubric will total up to {points} points. Evaluate the attemped answer against the provided rubric. Pay close attention to detail and grade it strictly, but fairly. Only evaluate against the rubric, as you yourself should not make any judgements (e.g., even if you think the answer is correct but rubric is wrong, you should treat the rubric as the gold standard). Return the absolute total number of points earned (it can be a decimal based on the rubric).
 
@@ -77,7 +77,19 @@ The rubric: {criterion}
 
 The attempted answer: {response}
 
-First, think step-by-step about each rubric item. Explain your reasoning for each rubric item. Then, tally the points up and write VERDICT: total points in the last line of your response, no other text. For example, VERDICT: 2.5 or VERDICT: 8."""
+First, think step-by-step about each rubric item. Explain your reasoning for each rubric item. Then, tally the points up and give the total in the last line of your response, wrapped in answer tags and containing nothing else, like this: <answer>total points earned</answer>"""
+
+# Verdict extraction. Both graders are asked to wrap their verdict in
+# <answer></answer>, which confines extraction to a delimited span instead of
+# scanning prose for a loose token — a bare number or keyword anywhere in the
+# response used to be fair game, and these graders quote the instructions back
+# inside their reasoning. Neither template contains a worked numeric example,
+# so an echoed instruction cannot supply a parseable value.
+#
+# re.DOTALL is safe here (unlike in _parse_rubric): `.*?` is non-greedy AND
+# bounded by the closing tag, so it cannot run away to end of input.
+_ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
+_ANSWER_NUM_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)")
 
 # ============================================================================
 # PYDANTIC MODELS
@@ -231,6 +243,31 @@ Please solve this problem and submit your final answer using the `submit_answer`
     # TRACK DETECTION
     # ========================================================================
 
+    @staticmethod
+    def _response_text(response: Any) -> str:
+        """Extract the grader's message text from a Responses API result.
+
+        Prefers `output_text` (the concatenated assistant text, excluding
+        reasoning items) and falls back to walking `output`. An empty result
+        means the grader returned nothing usable, which is an env-side failure
+        rather than a zero-scoring answer, so it raises.
+        """
+        text = (getattr(response, "output_text", "") or "").strip()
+        if not text:
+            for item in getattr(response, "output", []) or []:
+                content = getattr(item, "content", None)
+                if content:
+                    if isinstance(content, list):
+                        text = content[0].text if content else ""
+                    else:
+                        text = content
+                elif getattr(item, "text", None):
+                    text = item.text
+            text = (text or "").strip()
+        if not text:
+            raise RuntimeError("grader returned an empty response")
+        return text
+
     def _is_research_track(self, answer: str) -> bool:
         """
         Detect if question is Research track based on rubric presence.
@@ -275,47 +312,31 @@ Please solve this problem and submit your final answer using the `submit_answer`
             submitted_answer=submitted,
         )
 
-        try:
-            response = await self.client.responses.create(
-                model="gpt-5.2",
-                reasoning={"effort": "high"},
-                input=[{"role": "user", "content": grader_prompt}],
-            )
+        # No try/except: a grader API failure is an env crash, not a wrong
+        # answer. Returning reward=0.0 here would be indistinguishable from a
+        # graded-incorrect submission and would poison training data silently.
+        response = await self.client.responses.create(
+            model="gpt-5.2",
+            reasoning={"effort": "high"},
+            input=[{"role": "user", "content": grader_prompt}],
+        )
+        grading_response = self._response_text(response)
 
-            # Extract text from response output
-            grading_response = ""
-            for item in response.output:
-                if hasattr(item, "content") and item.content:
-                    # Handle content as list (OpenAI Responses API returns list of blocks)
-                    if isinstance(item.content, list):
-                        grading_response = item.content[0].text if item.content else ""
-                    else:
-                        grading_response = item.content
-                elif hasattr(item, "text") and item.text:
-                    grading_response = item.text
+        # Parse verdict
+        is_correct = self._parse_verdict(grading_response)
 
-            # Parse verdict
-            is_correct = self._parse_verdict(grading_response)
-
-            return {
-                "reward": 1.0 if is_correct else 0.0,
-                "feedback": (
-                    f"{'✅ Correct!' if is_correct else '❌ Incorrect'}\n\n"
-                    f"{grading_response}"
-                ),
-                "details": {
-                    "is_correct": is_correct,
-                    "grading_response": grading_response,
-                    "expected": self.task["answer"],
-                },
-            }
-
-        except Exception as e:
-            return {
-                "reward": 0.0,
-                "feedback": f"⚠️ Grading error: {str(e)}",
-                "details": {"error": str(e)},
-            }
+        return {
+            "reward": 1.0 if is_correct else 0.0,
+            "feedback": (
+                f"{'✅ Correct!' if is_correct else '❌ Incorrect'}\n\n"
+                f"{grading_response}"
+            ),
+            "details": {
+                "is_correct": is_correct,
+                "grading_response": grading_response,
+                "expected": self.task["answer"],
+            },
+        }
 
     def _parse_verdict(self, grading_response: str) -> bool:
         """
@@ -330,20 +351,26 @@ Please solve this problem and submit your final answer using the `submit_answer`
         Returns:
             True if correct, False if incorrect
         """
-        upper_response = grading_response.upper()
+        # Take the LAST answer tag: the grader's reasoning may quote the
+        # instruction or state an interim verdict before revising it, and a
+        # first-match scan would lock in the wrong one.
+        tags = _ANSWER_TAG_RE.findall(grading_response)
+        if tags:
+            verdict = tags[-1].strip().upper()
+            # INCORRECT contains CORRECT, so test it first.
+            if "INCORRECT" in verdict:
+                return False
+            if "CORRECT" in verdict:
+                return True
 
-        # Look for explicit verdict
-        if "VERDICT: CORRECT" in upper_response:
-            return True
-        if "VERDICT: INCORRECT" in upper_response:
-            return False
-
-        # Fallback: check for "CORRECT" without "INCORRECT"
-        if "CORRECT" in upper_response and "INCORRECT" not in upper_response:
-            return True
-
-        # Default to incorrect if unclear
-        return False
+        # No usable verdict. The old code guessed from a bare "CORRECT"
+        # substring anywhere in the response and otherwise defaulted to
+        # incorrect — both fabricate a grade the judge never gave, and the
+        # default silently converts a broken grader into a 0.0 reward.
+        raise RuntimeError(
+            "grader response contained no <answer>CORRECT|INCORRECT</answer> — "
+            f"cannot grade submission. Response tail: {grading_response[-500:]!r}"
+        )
 
     # ========================================================================
     # RESEARCH TRACK GRADING
@@ -362,56 +389,48 @@ Please solve this problem and submit your final answer using the `submit_answer`
         Returns:
             Dictionary with reward, feedback, and grading details
         """
-        # Parse rubric from answer field
+        # Parse rubric from answer field. _parse_rubric raises on a mis-parse;
+        # an empty rubric on a task routed here (i.e. one whose answer contains
+        # "Points:" and "Item:") means the dataset row is malformed.
         rubric_items = self._parse_rubric(self.task["answer"])
-
         if not rubric_items:
-            # Fallback if rubric parsing fails
-            return {
-                "reward": 0.0,
-                "feedback": (
-                    "⚠️ Unable to parse grading rubric. "
-                    "Please contact support."
-                ),
-                "details": {"error": "rubric_parsing_failed"},
-            }
-
-        try:
-            # Grade each rubric item in parallel
-            grading_tasks = [
-                self._grade_single_criterion(submitted, item)
-                for item in rubric_items
-            ]
-            criterion_results = await asyncio.gather(*grading_tasks)
-
-            # Calculate total score
-            total_possible = sum(item["points"] for item in rubric_items)
-            total_earned = sum(result["score"] for result in criterion_results)
-            reward = (
-                total_earned / total_possible if total_possible > 0 else 0.0
+            raise RuntimeError(
+                f"task {self.task['task_id']} routed to the research track but "
+                f"no rubric items parsed from its answer field"
             )
 
-            # Format feedback
-            feedback = self._format_research_feedback(
-                criterion_results, total_earned, total_possible, reward
+        # No try/except: grader failures propagate. Swallowing them into
+        # reward=0.0 makes an env crash look like a submission that earned
+        # nothing, which is the one outcome a reward channel must never fake.
+        criterion_results = await asyncio.gather(*[
+            self._grade_single_criterion(submitted, item)
+            for item in rubric_items
+        ])
+
+        # Calculate total score
+        total_possible = sum(item["points"] for item in rubric_items)
+        total_earned = sum(result["score"] for result in criterion_results)
+        if total_possible <= 0:
+            raise RuntimeError(
+                f"task {self.task['task_id']} rubric totals {total_possible} "
+                f"points; cannot normalise a reward"
             )
+        reward = total_earned / total_possible
 
-            return {
-                "reward": reward,
-                "feedback": feedback,
-                "details": {
-                    "total_earned": total_earned,
-                    "total_possible": total_possible,
-                    "criterion_results": criterion_results,
-                },
-            }
+        # Format feedback
+        feedback = self._format_research_feedback(
+            criterion_results, total_earned, total_possible, reward
+        )
 
-        except Exception as e:
-            return {
-                "reward": 0.0,
-                "feedback": f"⚠️ Grading error: {str(e)}",
-                "details": {"error": str(e)},
-            }
+        return {
+            "reward": reward,
+            "feedback": feedback,
+            "details": {
+                "total_earned": total_earned,
+                "total_possible": total_possible,
+                "criterion_results": criterion_results,
+            },
+        }
 
     def _parse_rubric(self, answer: str) -> List[Dict[str, Any]]:
         """
@@ -428,14 +447,32 @@ Please solve this problem and submit your final answer using the `submit_answer`
         """
         rubric_items = []
 
-        # Pattern to match "Points: X, Item: ..." entries
+        # Pattern to match "Points: X, Item: ..." entries. An item's body runs
+        # to the next line that starts a new "Points:" entry, which is what the
+        # `(?!Points:)` guard is for — so this must NOT be compiled with
+        # re.DOTALL. Under DOTALL the `.*` spans newlines, the first item's
+        # continuation line swallows the entire remaining rubric, and a 10-item
+        # rubric parses as ONE criterion worth 1.0 point (destroying the reward
+        # scale: see the invariant below).
         pattern = r"Points:\s*([\d.]+),\s*Item:\s*([^\n]+(?:\n(?!Points:).*)*)"
-        matches = re.finditer(pattern, answer, re.MULTILINE | re.DOTALL)
+        matches = re.finditer(pattern, answer, re.MULTILINE)
 
         for match in matches:
             points = float(match.group(1))
             criterion = match.group(2).strip()
             rubric_items.append({"points": points, "criterion": criterion})
+
+        # Every "Points: X, Item:" header in the answer must have produced an
+        # item. A mismatch means items were merged or dropped, which silently
+        # rescales total_possible and corrupts every reward for this task, so
+        # fail loudly instead of grading against a wrong denominator.
+        expected = len(re.findall(r"Points:\s*[\d.]+,\s*Item:", answer))
+        if len(rubric_items) != expected:
+            raise RuntimeError(
+                f"rubric parse produced {len(rubric_items)} item(s) but the "
+                f"answer contains {expected} 'Points: X, Item:' header(s); "
+                f"refusing to grade against a mis-parsed rubric"
+            )
 
         return rubric_items
 
@@ -459,41 +496,23 @@ Please solve this problem and submit your final answer using the `submit_answer`
             response=response,
         )
 
-        try:
-            response = await self.client.responses.create(
-                model="gpt-5.2",
-                reasoning={"effort": "high"},
-                input=[{"role": "user", "content": grader_prompt}],
-            )
+        # No try/except: a failed criterion grade must not silently become 0.0
+        # points. One swallowed API error used to drop the whole submission's
+        # score by a criterion with no trace in the reward.
+        response = await self.client.responses.create(
+            model="gpt-5.2",
+            reasoning={"effort": "high"},
+            input=[{"role": "user", "content": grader_prompt}],
+        )
+        grading_response = self._response_text(response)
+        score = self._parse_score(grading_response, rubric_item["points"])
 
-            # Extract text from response output
-            grading_response = ""
-            for item in response.output:
-                if hasattr(item, "content") and item.content:
-                    # Handle content as list (OpenAI Responses API returns list of blocks)
-                    if isinstance(item.content, list):
-                        grading_response = item.content[0].text if item.content else ""
-                    else:
-                        grading_response = item.content
-                elif hasattr(item, "text") and item.text:
-                    grading_response = item.text
-
-            score = self._parse_score(grading_response, rubric_item["points"])
-
-            return {
-                "criterion": rubric_item["criterion"],
-                "max_points": rubric_item["points"],
-                "score": score,
-                "grading_response": grading_response,
-            }
-
-        except Exception as e:
-            return {
-                "criterion": rubric_item["criterion"],
-                "max_points": rubric_item["points"],
-                "score": 0.0,
-                "grading_response": f"Error: {str(e)}",
-            }
+        return {
+            "criterion": rubric_item["criterion"],
+            "max_points": rubric_item["points"],
+            "score": score,
+            "grading_response": grading_response,
+        }
 
     def _parse_score(self, grading_response: str, max_points: float) -> float:
         """
@@ -506,22 +525,29 @@ Please solve this problem and submit your final answer using the `submit_answer`
         Returns:
             Extracted score, clamped to [0, max_points]
         """
-        # Primary: Look for "Score: X" pattern
-        match = re.search(
-            r"Score:\s*([\d.]+)", grading_response, re.IGNORECASE
-        )
-        if match:
-            score = float(match.group(1))
-            return max(0.0, min(max_points, score))
+        # RESEARCH_GRADER_TEMPLATE asks for the tally in <answer></answer> on
+        # the last line. Take the LAST tag: the grader's reasoning quotes the
+        # instruction back and may state an interim tally before revising it.
+        tags = _ANSWER_TAG_RE.findall(grading_response)
+        if not tags:
+            # No answer tag means the grader did not answer the question we
+            # asked. Scoring that as 0.0 is indistinguishable from a genuinely
+            # worthless answer, so raise instead of inventing a grade.
+            raise RuntimeError(
+                "grader response contained no <answer></answer> tag — cannot "
+                f"score criterion. Response tail: {grading_response[-500:]!r}"
+            )
 
-        # Fallback: Find any number in response
-        numbers = re.findall(r"\b(\d+(?:\.\d+)?)\b", grading_response)
-        if numbers:
-            score = float(numbers[-1])
-            return max(0.0, min(max_points, score))
+        # Tolerate decoration inside the tag ("4.0 points", "**3**") — the tag
+        # already bounds where we look, which is what makes this safe.
+        number = _ANSWER_NUM_RE.search(tags[-1])
+        if not number:
+            raise RuntimeError(
+                "grader's <answer> tag contained no number — cannot score "
+                f"criterion. Tag contents: {tags[-1][:200]!r}"
+            )
 
-        # Default to 0 if parsing fails
-        return 0.0
+        return max(0.0, min(max_points, float(number.group(1))))
 
     def _format_research_feedback(
         self,
