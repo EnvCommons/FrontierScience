@@ -355,16 +355,15 @@ Please solve this problem and submit your final answer using the `submit_answer`
         # Parse verdict
         is_correct = self._parse_verdict(grading_response)
 
+        # Only the verdict goes back. The whole ToolOutput — blocks AND
+        # metadata — reaches the model, so the reference answer, or the
+        # grader's reasoning (which quotes it), would give the model the
+        # answer to copy into a resubmission.
         return {
             "reward": 1.0 if is_correct else 0.0,
-            "feedback": (
-                f"{'✅ Correct!' if is_correct else '❌ Incorrect'}\n\n"
-                f"{grading_response}"
-            ),
+            "feedback": "✅ Correct!" if is_correct else "❌ Incorrect",
             "details": {
                 "is_correct": is_correct,
-                "grading_response": grading_response,
-                "expected": self.task["answer"],
             },
         }
 
@@ -452,13 +451,16 @@ Please solve this problem and submit your final answer using the `submit_answer`
             criterion_results, total_earned, total_possible, reward
         )
 
+        # Scores only: the criterion text and the grader's per-criterion
+        # reasoning spell out the rubric, i.e. the reference solution, and the
+        # whole ToolOutput (metadata included) reaches the model.
         return {
             "reward": reward,
             "feedback": feedback,
             "details": {
                 "total_earned": total_earned,
                 "total_possible": total_possible,
-                "criterion_results": criterion_results,
+                "criterion_scores": [r["score"] for r in criterion_results],
             },
         }
 
@@ -582,7 +584,10 @@ Please solve this problem and submit your final answer using the `submit_answer`
         reward: float,
     ) -> str:
         """
-        Format detailed feedback for Research track grading.
+        Format score-only feedback for Research track grading.
+
+        Per-criterion points only: the criterion text and the grader's
+        reasoning would reveal the rubric (the reference solution).
 
         Args:
             criterion_results: List of grading results per criterion
@@ -596,18 +601,9 @@ Please solve this problem and submit your final answer using the `submit_answer`
         lines = ["# Rubric Evaluation Results\n"]
 
         for i, result in enumerate(criterion_results, 1):
-            lines.append(f"## Criterion {i}")
             lines.append(
-                f"**Points:** {result['score']:.2f}/{result['max_points']}"
+                f"- Criterion {i}: {result['score']:.2f}/{result['max_points']}"
             )
-
-            # Truncate long criteria for readability
-            criterion_text = result["criterion"]
-            if len(criterion_text) > 200:
-                criterion_text = criterion_text[:200] + "..."
-
-            lines.append(f"**Criterion:** {criterion_text}")
-            lines.append(f"**Feedback:** {result['grading_response']}\n")
 
         lines.append("---")
         lines.append(f"## Final Score: {total_earned:.2f}/{total_possible}")
