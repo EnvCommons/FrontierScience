@@ -96,6 +96,8 @@ GRADER_MAX_OUTPUT_TOKENS = 16384
 # Retries don't cancel the abandoned upstream generation, so keep them rare.
 GRADER_TIMEOUT_S = 1200
 GRADER_MAX_RETRIES = 1
+# Hitting the output cap is usually a one-off ramble, so resample.
+GRADER_MAX_ATTEMPTS = 3
 
 # ============================================================================
 # PYDANTIC MODELS
@@ -255,19 +257,26 @@ Please solve this problem and submit your final answer using the `submit_answer`
 
     async def _call_grader(self, grader_prompt: str) -> str:
         """Run one grader call and return its message text."""
-        response = await self.client.responses.create(
-            model="gpt-5.2",
-            reasoning={"effort": "high"},
-            max_output_tokens=GRADER_MAX_OUTPUT_TOKENS,
-            input=[{"role": "user", "content": grader_prompt}],
-        )
-        if getattr(response, "status", None) == "incomplete":
-            details = getattr(response, "incomplete_details", None)
-            raise RuntimeError(
-                f"grader response incomplete ({getattr(details, 'reason', None)}); "
-                f"cannot grade a truncated verdict"
+        for attempt in range(1, GRADER_MAX_ATTEMPTS + 1):
+            response = await self.client.responses.create(
+                model="gpt-5.2",
+                reasoning={"effort": "high"},
+                max_output_tokens=GRADER_MAX_OUTPUT_TOKENS,
+                input=[{"role": "user", "content": grader_prompt}],
             )
-        return self._response_text(response)
+            if getattr(response, "status", None) != "incomplete":
+                return self._response_text(response)
+            reason = getattr(
+                getattr(response, "incomplete_details", None), "reason", None
+            )
+            print(
+                f"grader response incomplete ({reason}), "
+                f"attempt {attempt}/{GRADER_MAX_ATTEMPTS}"
+            )
+        raise RuntimeError(
+            f"grader response incomplete ({reason}) after "
+            f"{GRADER_MAX_ATTEMPTS} attempts; cannot grade a truncated verdict"
+        )
 
     @staticmethod
     def _response_text(response: Any) -> str:
