@@ -49,6 +49,8 @@ Data consists of a Parquet file (`frontierscience.parquet`) sourced from [Huggin
 |------|-------------|
 | `submit_answer` | Submit your final answer for grading. Ends the episode. |
 
+`submit_answer` returns only the verdict (Olympiad) or the per-criterion points and total score (Research). The reference answer, the rubric text and the grader's reasoning are never returned to the agent.
+
 ## Time Horizon
 
 Single-turn. The agent reads the scientific problem and submits one answer.
