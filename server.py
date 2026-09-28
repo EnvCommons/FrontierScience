@@ -91,6 +91,12 @@ First, think step-by-step about each rubric item. Explain your reasoning for eac
 _ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
 _ANSWER_NUM_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)")
 
+# Uncapped high-effort grader calls ran for up to an hour in prod.
+GRADER_MAX_OUTPUT_TOKENS = 16384
+# Retries don't cancel the abandoned upstream generation, so keep them rare.
+GRADER_TIMEOUT_S = 1200
+GRADER_MAX_RETRIES = 1
+
 # ============================================================================
 # PYDANTIC MODELS
 # ============================================================================
@@ -180,7 +186,11 @@ class FrontierScience(Environment):
                 "Both Olympiad and Research tracks use LLM-based grading."
             )
 
-        self.client = openai.AsyncClient(api_key=api_key)
+        self.client = openai.AsyncClient(
+            api_key=api_key,
+            timeout=GRADER_TIMEOUT_S,
+            max_retries=GRADER_MAX_RETRIES,
+        )
 
         # Load full task data
         self.task = next(
@@ -242,6 +252,22 @@ Please solve this problem and submit your final answer using the `submit_answer`
     # ========================================================================
     # TRACK DETECTION
     # ========================================================================
+
+    async def _call_grader(self, grader_prompt: str) -> str:
+        """Run one grader call and return its message text."""
+        response = await self.client.responses.create(
+            model="gpt-5.2",
+            reasoning={"effort": "high"},
+            max_output_tokens=GRADER_MAX_OUTPUT_TOKENS,
+            input=[{"role": "user", "content": grader_prompt}],
+        )
+        if getattr(response, "status", None) == "incomplete":
+            details = getattr(response, "incomplete_details", None)
+            raise RuntimeError(
+                f"grader response incomplete ({getattr(details, 'reason', None)}); "
+                f"cannot grade a truncated verdict"
+            )
+        return self._response_text(response)
 
     @staticmethod
     def _response_text(response: Any) -> str:
@@ -315,12 +341,7 @@ Please solve this problem and submit your final answer using the `submit_answer`
         # No try/except: a grader API failure is an env crash, not a wrong
         # answer. Returning reward=0.0 here would be indistinguishable from a
         # graded-incorrect submission and would poison training data silently.
-        response = await self.client.responses.create(
-            model="gpt-5.2",
-            reasoning={"effort": "high"},
-            input=[{"role": "user", "content": grader_prompt}],
-        )
-        grading_response = self._response_text(response)
+        grading_response = await self._call_grader(grader_prompt)
 
         # Parse verdict
         is_correct = self._parse_verdict(grading_response)
@@ -499,12 +520,7 @@ Please solve this problem and submit your final answer using the `submit_answer`
         # No try/except: a failed criterion grade must not silently become 0.0
         # points. One swallowed API error used to drop the whole submission's
         # score by a criterion with no trace in the reward.
-        response = await self.client.responses.create(
-            model="gpt-5.2",
-            reasoning={"effort": "high"},
-            input=[{"role": "user", "content": grader_prompt}],
-        )
-        grading_response = self._response_text(response)
+        grading_response = await self._call_grader(grader_prompt)
         score = self._parse_score(grading_response, rubric_item["points"])
 
         return {
