@@ -10,7 +10,6 @@ Dataset: https://huggingface.co/datasets/openai/frontierscience
 
 from __future__ import annotations
 
-import asyncio
 import re
 from typing import Any, Dict, List
 
@@ -73,7 +72,7 @@ RESEARCH_GRADER_TEMPLATE = """You are grading a science exam. You will be given 
 
 The problem: {problem}
 
-The rubric: {criterion}
+The rubric: {rubric}
 
 The attempted answer: {response}
 
@@ -93,6 +92,8 @@ _ANSWER_NUM_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)")
 
 # Uncapped high-effort grader calls ran for up to an hour in prod.
 GRADER_MAX_OUTPUT_TOKENS = 16384
+# One research call reasons over the whole ~10-item rubric.
+RESEARCH_GRADER_MAX_OUTPUT_TOKENS = 32768
 # Retries don't cancel the abandoned upstream generation, so keep them rare.
 GRADER_TIMEOUT_S = 1200
 GRADER_MAX_RETRIES = 1
@@ -127,7 +128,7 @@ class FrontierScience(Environment):
 
     Supports two tracks:
     - Olympiad Track: Short-answer format with LLM-based equivalence checking
-    - Research Track: Open-ended problems with multi-criterion rubric grading
+    - Research Track: Open-ended problems with rubric grading
     """
 
     @classmethod
@@ -221,7 +222,7 @@ Please solve this problem and submit your final answer using the `submit_answer`
 
         This tool will evaluate your answer using LLM-based grading:
         - Olympiad track: Checks for equivalence with reference answer
-        - Research track: Evaluates against multi-criterion rubric
+        - Research track: Evaluates against the task's rubric
 
         Args:
             params: SubmitAnswerInput containing your answer
@@ -255,13 +256,17 @@ Please solve this problem and submit your final answer using the `submit_answer`
     # TRACK DETECTION
     # ========================================================================
 
-    async def _call_grader(self, grader_prompt: str) -> str:
+    async def _call_grader(
+        self,
+        grader_prompt: str,
+        max_output_tokens: int = GRADER_MAX_OUTPUT_TOKENS,
+    ) -> str:
         """Run one grader call and return its message text."""
         for attempt in range(1, GRADER_MAX_ATTEMPTS + 1):
             response = await self.client.responses.create(
                 model="gpt-5.2",
                 reasoning={"effort": "high"},
-                max_output_tokens=GRADER_MAX_OUTPUT_TOKENS,
+                max_output_tokens=max_output_tokens,
                 input=[{"role": "user", "content": grader_prompt}],
             )
             if getattr(response, "status", None) != "incomplete":
@@ -407,10 +412,10 @@ Please solve this problem and submit your final answer using the `submit_answer`
 
     async def _grade_research_track(self, submitted: str) -> dict:
         """
-        Grade Research track using LLM against parsed rubrics.
+        Grade Research track using LLM against the task's rubric.
 
-        Parses the rubric from the answer field, grades the submission
-        against each criterion in parallel, and aggregates scores.
+        As in the paper, one grader call scores the submission against the
+        whole rubric and returns the total points earned.
 
         Args:
             submitted: The user's submitted answer
@@ -418,49 +423,50 @@ Please solve this problem and submit your final answer using the `submit_answer`
         Returns:
             Dictionary with reward, feedback, and grading details
         """
-        # Parse rubric from answer field. _parse_rubric raises on a mis-parse;
-        # an empty rubric on a task routed here (i.e. one whose answer contains
-        # "Points:" and "Item:") means the dataset row is malformed.
+        # The parse is only used for the denominator. _parse_rubric raises on a
+        # mis-parse; an empty rubric on a task routed here (i.e. one whose
+        # answer contains "Points:" and "Item:") means the dataset row is
+        # malformed.
         rubric_items = self._parse_rubric(self.task["answer"])
         if not rubric_items:
             raise RuntimeError(
                 f"task {self.task['task_id']} routed to the research track but "
                 f"no rubric items parsed from its answer field"
             )
-
-        # No try/except: grader failures propagate. Swallowing them into
-        # reward=0.0 makes an env crash look like a submission that earned
-        # nothing, which is the one outcome a reward channel must never fake.
-        criterion_results = await asyncio.gather(*[
-            self._grade_single_criterion(submitted, item)
-            for item in rubric_items
-        ])
-
-        # Calculate total score
         total_possible = sum(item["points"] for item in rubric_items)
-        total_earned = sum(result["score"] for result in criterion_results)
         if total_possible <= 0:
             raise RuntimeError(
                 f"task {self.task['task_id']} rubric totals {total_possible} "
                 f"points; cannot normalise a reward"
             )
-        reward = total_earned / total_possible
 
-        # Format feedback
-        feedback = self._format_research_feedback(
-            criterion_results, total_earned, total_possible, reward
+        grader_prompt = RESEARCH_GRADER_TEMPLATE.format(
+            problem=self.task["problem"],
+            points=f"{total_possible:g}",
+            rubric=self.task["answer"],
+            response=submitted,
         )
 
-        # Scores only: the criterion text and the grader's per-criterion
-        # reasoning spell out the rubric, i.e. the reference solution, and the
-        # whole ToolOutput (metadata included) reaches the model.
+        # No try/except: grader failures propagate. Swallowing them into
+        # reward=0.0 makes an env crash look like a submission that earned
+        # nothing, which is the one outcome a reward channel must never fake.
+        grading_response = await self._call_grader(
+            grader_prompt, max_output_tokens=RESEARCH_GRADER_MAX_OUTPUT_TOKENS
+        )
+        total_earned = self._parse_score(grading_response, total_possible)
+        reward = total_earned / total_possible
+
+        # Scores only: the grader's reasoning spells out the rubric, i.e. the
+        # reference solution, and the whole ToolOutput (metadata included)
+        # reaches the model.
         return {
             "reward": reward,
-            "feedback": feedback,
+            "feedback": self._format_research_feedback(
+                total_earned, total_possible, reward
+            ),
             "details": {
                 "total_earned": total_earned,
                 "total_possible": total_possible,
-                "criterion_scores": [r["score"] for r in criterion_results],
             },
         }
 
@@ -508,46 +514,13 @@ Please solve this problem and submit your final answer using the `submit_answer`
 
         return rubric_items
 
-    async def _grade_single_criterion(
-        self, response: str, rubric_item: dict
-    ) -> dict:
-        """
-        Grade response against a single rubric criterion.
-
-        Args:
-            response: The user's submitted response
-            rubric_item: Dictionary with 'points' and 'criterion' keys
-
-        Returns:
-            Dictionary with criterion details, score, and grading response
-        """
-        grader_prompt = RESEARCH_GRADER_TEMPLATE.format(
-            problem=self.task["problem"],
-            points=rubric_item["points"],
-            criterion=rubric_item["criterion"],
-            response=response,
-        )
-
-        # No try/except: a failed criterion grade must not silently become 0.0
-        # points. One swallowed API error used to drop the whole submission's
-        # score by a criterion with no trace in the reward.
-        grading_response = await self._call_grader(grader_prompt)
-        score = self._parse_score(grading_response, rubric_item["points"])
-
-        return {
-            "criterion": rubric_item["criterion"],
-            "max_points": rubric_item["points"],
-            "score": score,
-            "grading_response": grading_response,
-        }
-
     def _parse_score(self, grading_response: str, max_points: float) -> float:
         """
         Extract score from grading response with fallback.
 
         Args:
             grading_response: The LLM judge's response
-            max_points: Maximum possible points for this criterion
+            max_points: Maximum possible points for the rubric
 
         Returns:
             Extracted score, clamped to [0, max_points]
@@ -562,7 +535,7 @@ Please solve this problem and submit your final answer using the `submit_answer`
             # worthless answer, so raise instead of inventing a grade.
             raise RuntimeError(
                 "grader response contained no <answer></answer> tag — cannot "
-                f"score criterion. Response tail: {grading_response[-500:]!r}"
+                f"score submission. Response tail: {grading_response[-500:]!r}"
             )
 
         # Tolerate decoration inside the tag ("4.0 points", "**3**") — the tag
@@ -571,14 +544,13 @@ Please solve this problem and submit your final answer using the `submit_answer`
         if not number:
             raise RuntimeError(
                 "grader's <answer> tag contained no number — cannot score "
-                f"criterion. Tag contents: {tags[-1][:200]!r}"
+                f"submission. Tag contents: {tags[-1][:200]!r}"
             )
 
         return max(0.0, min(max_points, float(number.group(1))))
 
     def _format_research_feedback(
         self,
-        criterion_results: List[dict],
         total_earned: float,
         total_possible: float,
         reward: float,
@@ -586,11 +558,10 @@ Please solve this problem and submit your final answer using the `submit_answer`
         """
         Format score-only feedback for Research track grading.
 
-        Per-criterion points only: the criterion text and the grader's
-        reasoning would reveal the rubric (the reference solution).
+        The rubric text and the grader's reasoning would reveal the reference
+        solution, so only the total is reported.
 
         Args:
-            criterion_results: List of grading results per criterion
             total_earned: Total points earned
             total_possible: Total points possible
             reward: Normalized reward [0, 1]
@@ -599,13 +570,6 @@ Please solve this problem and submit your final answer using the `submit_answer`
             Formatted markdown feedback string
         """
         lines = ["# Rubric Evaluation Results\n"]
-
-        for i, result in enumerate(criterion_results, 1):
-            lines.append(
-                f"- Criterion {i}: {result['score']:.2f}/{result['max_points']}"
-            )
-
-        lines.append("---")
         lines.append(f"## Final Score: {total_earned:.2f}/{total_possible}")
         lines.append(f"## Normalized Reward: {reward:.3f}")
         lines.append(

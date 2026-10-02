@@ -37,7 +37,7 @@ This is a single-turn environment with two grading methodologies:
 
 **Olympiad Track**: An LLM grader (gpt-5.2 with high reasoning effort) checks equivalence with the reference answer, considering algebraic equivalence, numeric tolerance, chemical equivalents, and unit conversions. Reward is binary: 1.0 if correct, 0.0 if incorrect.
 
-**Research Track**: An LLM grader (gpt-5.2 with high reasoning effort) evaluates against a multi-criterion rubric parsed from the answer field. Each criterion is graded independently, scores are aggregated, and reward is normalized (total earned / total possible). Success threshold is 7+ points out of 10 (0.7 reward).
+**Research Track**: An LLM grader (gpt-5.2 with high reasoning effort) scores the answer against the task's whole rubric in a single call, as in the paper, and reports the total points earned. Reward is normalized (total earned / total possible). Success threshold is 7+ points out of 10 (0.7 reward).
 
 ## Data
 
@@ -49,7 +49,7 @@ Data consists of a Parquet file (`frontierscience.parquet`) sourced from [Huggin
 |------|-------------|
 | `submit_answer` | Submit your final answer for grading. Ends the episode. |
 
-`submit_answer` returns only the verdict (Olympiad) or the per-criterion points and total score (Research). The reference answer, the rubric text and the grader's reasoning are never returned to the agent.
+`submit_answer` returns only the verdict (Olympiad) or the total score (Research). The reference answer, the rubric text and the grader's reasoning are never returned to the agent.
 
 ## Time Horizon
 
